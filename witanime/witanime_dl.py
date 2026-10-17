@@ -20,6 +20,7 @@ Manual / legacy modes:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -254,6 +256,96 @@ class WitAnime:
             r2.close()
         return direct, sanitize(fname), int(total) if total and total.isdigit() else None
 
+    def _workupload_solve(self, ref_url):
+        r = self.s.get(
+            "https://workupload.com/puzzle",
+            headers={"Referer": ref_url, "X-Requested-With": "XMLHttpRequest"},
+            timeout=self.timeout,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"workupload puzzle failed (HTTP {r.status_code})")
+        data = r.json()
+        data = data.get("data") or data
+        puzzle = data.get("puzzle")
+        find = data.get("find")
+        rng = int(data.get("range") or 0)
+        if not puzzle or not find or rng <= 0:
+            raise RuntimeError("workupload puzzle response incomplete")
+        if isinstance(find, str):
+            targets = [find[i : i + 64] for i in range(0, len(find), 64)]
+        else:
+            targets = list(find)
+        solutions = {}
+        for i in range(rng):
+            h = hashlib.sha256((puzzle + str(i)).encode()).hexdigest()
+            if h in targets:
+                solutions[h] = i
+        if any(t not in solutions for t in targets):
+            raise RuntimeError("workupload puzzle not solvable")
+        captcha = " ".join(str(solutions[t]) for t in targets) + " "
+        r = self.s.post(
+            "https://workupload.com/captcha",
+            data={"captcha": captcha},
+            headers={"Referer": ref_url, "X-Requested-With": "XMLHttpRequest"},
+            timeout=self.timeout,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"workupload captcha failed (HTTP {r.status_code})")
+
+    @staticmethod
+    def _parse_workupload_page(html):
+        name = None
+        m = re.search(r"Filename:&nbsp;</td><td[^>]*>(.*?)</td>", html, re.S)
+        if m:
+            name = html_unescape(m.group(1)).strip()
+        if not name:
+            m = re.search(r"<title>(.*?)</title>", html, re.S)
+            if m:
+                name = html_unescape(m.group(1)).strip()
+                name = re.sub(r"\s*[-|]\s*workupload(?:\.com)?\s*$", "", name, flags=re.I)
+        size = None
+        m = re.search(r"Filesize:&nbsp;</td><td>\s*(\d+)\s*\(Byte\)", html)
+        if m:
+            size = int(m.group(1))
+        return name, size
+
+    def workupload_direct(self, wu_url):
+        m = re.search(r"workupload\.com/file/([A-Za-z0-9]+)", wu_url)
+        if not m:
+            raise RuntimeError(f"not a workupload file link: {wu_url}")
+        fid = m.group(1)
+        fname = size = None
+        real = False
+        for attempt in range(1, 4):
+            r = self.s.get(wu_url, headers={"Referer": BASE}, timeout=self.timeout)
+            r.raise_for_status()
+            if "/start/" in r.text or "Filesize:" in r.text:
+                fname, size = self._parse_workupload_page(r.text)
+                real = True
+                break
+            log(f"    workupload: solving human-verification puzzle (attempt {attempt}/3) ...")
+            self._workupload_solve(wu_url)
+        if not real:
+            raise RuntimeError("workupload: could not pass human verification")
+        self.s.get(
+            f"https://workupload.com/start/{fid}",
+            headers={"Referer": wu_url},
+            timeout=self.timeout,
+        )
+        api = self.s.get(
+            f"https://workupload.com/api/file/getDownloadServer/{fid}",
+            headers={"Referer": wu_url, "X-Requested-With": "XMLHttpRequest"},
+            timeout=self.timeout,
+        )
+        direct = None
+        try:
+            direct = (api.json().get("data") or {}).get("url")
+        except Exception:
+            pass
+        if not direct:
+            raise RuntimeError(f"workupload gave no download url (HTTP {api.status_code})")
+        return direct, sanitize(fname or fid), size
+
     def download(self, url, referer, dest, retries=3):
         part = dest + ".part"
         for attempt in range(1, retries + 1):
@@ -321,26 +413,36 @@ def extract_anime_title(html, slug):
     return slug
 
 
+def match_server_entries(entries, server):
+    out = [
+        e
+        for e in entries
+        if str(e.get("label", "")).lower().startswith(server)
+        and e.get("version", "sub") in ("sub", None, "")
+    ]
+    if not out:
+        out = [e for e in entries if str(e.get("label", "")).lower().startswith(server)]
+    if server == "mediafire" and not out:
+        out = [e for e in entries if "mediafire" in str(e.get("label", "")).lower()]
+    return out
+
+
 def pick_downloads(downloads, quality, server):
-    """Return list of download entries matching server, preferring `quality`,
-    then other qualities in QUALITY_ORDER."""
+    """Return (quality, entries, server_used) matching `server`, preferring `quality`,
+    then other qualities in QUALITY_ORDER.
+    When `server` is mediafire, workupload is used as fallback."""
     server = server.lower()
     qualities = [q for q in ([quality] if quality else []) if q and q in downloads]
     qualities += [q for q in QUALITY_ORDER if q in downloads and q not in qualities]
+    servers = [server]
+    if server == "mediafire":
+        servers.append("workupload")
     for q in qualities:
-        entries = [
-            e
-            for e in downloads[q]
-            if str(e.get("label", "")).lower().startswith(server)
-            and e.get("version", "sub") in ("sub", None, "")
-        ]
-        if not entries:
-            entries = [e for e in downloads[q] if str(e.get("label", "")).lower().startswith(server)]
-        if server == "mediafire" and not entries:
-            entries = [e for e in downloads[q] if "mediafire" in str(e.get("label", "")).lower()]
-        if entries:
-            return q, entries
-    return None, []
+        for srv in servers:
+            entries = match_server_entries(downloads[q], srv)
+            if entries:
+                return q, entries, srv
+    return None, [], server
 
 
 def parse_target(target):
@@ -696,7 +798,11 @@ def process_job(job_path, repo, work_root, args, finalize_allowed=False):
                 log(f"[job] {title}: episode {ep}: stored link failed, re-resolving fresh link ...")
                 if dest.exists():
                     dest.unlink()
-                direct, _fresh_name, fresh_size = client.mediafire_direct(page)
+                server = str(rec.get("server") or "mediafire").lower()
+                if server == "workupload":
+                    direct, _fresh_name, fresh_size = client.workupload_direct(page)
+                else:
+                    direct, _fresh_name, fresh_size = client.mediafire_direct(page)
                 if not exp:
                     exp = fresh_size
                 written = client.download(direct, page, str(dest), retries=args.retries)
@@ -730,10 +836,20 @@ def process_job(job_path, repo, work_root, args, finalize_allowed=False):
                 missing.append(ep)
             continue
         try:
-            files = extract_zip_flat(zpath, folder, ep)
-            zpath.unlink()
+            if zipfile.is_zipfile(zpath):
+                files = extract_zip_flat(zpath, folder, ep)
+                zpath.unlink()
+                log(f"[job] {title}: episode {ep} extracted ({len(files)} file(s))")
+            else:
+                if is_html_file(zpath):
+                    raise RuntimeError("downloaded file is HTML (challenge/error page), not media")
+                fname = sanitize(zpath.name)
+                target = folder / fname
+                if target.exists():
+                    target.unlink()
+                os.replace(zpath, target)
+                log(f"[job] {title}: episode {ep} kept as-is (not an archive) -> {fname}")
             extracted.append(ep)
-            log(f"[job] {title}: episode {ep} extracted ({len(files)} file(s))")
         except Exception as ex:
             log(f"[job] {title}: episode {ep} extract FAILED -> {ex}")
             if ep not in missing:
@@ -899,7 +1015,7 @@ def interactive(args):
 
     anime_title = getattr(client, "anime_title", None) or slug
     log(f"Title: {anime_title}")
-    log(f"Episodes: {len(chosen)}  |  Quality: {quality}  |  Server: mediafire")
+    log(f"Episodes: {len(chosen)}  |  Quality: {quality}  |  Server: mediafire (workupload fallback)")
     log("-" * 62)
 
     exported = {}
@@ -913,25 +1029,29 @@ def interactive(args):
                 failed += 1
                 continue
             downloads = client.downloads(slug, e)
-            quality_used, entries = pick_downloads(downloads, quality, "mediafire")
+            quality_used, entries, server_used = pick_downloads(downloads, quality, "mediafire")
             if not entries:
-                log(f"{prefix}: no mediafire link available, skipping")
+                log(f"{prefix}: no mediafire/workupload link available, skipping")
                 failed += 1
                 continue
             for entry in entries:
                 label = entry.get("label", "file")
-                mf_url = client.resolve_mediafire(slug, e, entry["token"])
-                direct, fname, size = client.mediafire_direct(mf_url)
+                src_url = client.resolve_mediafire(slug, e, entry["token"])
+                if server_used == "workupload":
+                    direct, fname, size = client.workupload_direct(src_url)
+                else:
+                    direct, fname, size = client.mediafire_direct(src_url)
                 exported[(e, label)] = {
                     "episode": e,
                     "quality": quality_used,
                     "label": label,
+                    "server": server_used,
                     "filename": fname,
                     "size": size,
-                    "page": mf_url,
+                    "page": src_url,
                     "url": direct,
                 }
-                log(f"{prefix} ({quality_used} {label}): link saved ({human(size)}) -> {fname}")
+                log(f"{prefix} ({quality_used} {label} [{server_used}]): link saved ({human(size)}) -> {fname}")
                 ok += 1
             time.sleep(args.delay)
         except KeyboardInterrupt:
@@ -1146,7 +1266,7 @@ def main():
                 continue
 
             downloads = client.downloads(slug, e)
-            quality_used, entries = pick_downloads(downloads, args.quality, args.server)
+            quality_used, entries, server_used = pick_downloads(downloads, args.quality, args.server)
             if not entries:
                 log(f"{prefix}: no '{args.server}' link available, skipping")
                 failed += 1
@@ -1154,8 +1274,11 @@ def main():
 
             for entry in entries:
                 part_label = entry.get("label", "file")
-                mf_url = client.resolve_mediafire(slug, e, entry["token"])
-                direct, fname, size = client.mediafire_direct(mf_url)
+                src_url = client.resolve_mediafire(slug, e, entry["token"])
+                if server_used == "workupload":
+                    direct, fname, size = client.workupload_direct(src_url)
+                else:
+                    direct, fname, size = client.mediafire_direct(src_url)
                 dest = os.path.join(outdir, fname)
 
                 if export_path:
@@ -1168,13 +1291,14 @@ def main():
                         "episode": e,
                         "quality": quality_used,
                         "label": part_label,
+                        "server": server_used,
                         "filename": fname,
                         "size": size,
-                        "page": mf_url,
+                        "page": src_url,
                         "url": direct,
                     }
                     save_links(export_path, exported)
-                    log(f"{prefix} ({quality_used} {part_label}): link saved ({human(size)}) -> {fname}")
+                    log(f"{prefix} ({quality_used} {part_label} [{server_used}]): link saved ({human(size)}) -> {fname}")
                     ok += 1
                     continue
 
@@ -1188,7 +1312,7 @@ def main():
                     continue
 
                 log(f"{prefix} ({quality_used} {part_label}): {fname} ({human(size)})")
-                written = client.download(direct, mf_url, dest, retries=args.retries)
+                written = client.download(direct, src_url, dest, retries=args.retries)
                 log(f"    done: {fname} ({human(written)})")
                 ok += 1
                 time.sleep(1.0)
