@@ -18,4 +18,4 @@ readlink -f /usr/bin/firefox | grep -q "^/usr/lib/firefox" && echo "=== FIREFOX 
 zip -v | head -2 && unzip -v | head -1
 ' && \
 docker exec -u root xfce-desktop bash /mnt/repo/witanime/setup_codespace.sh && \
-docker exec -u root xfce-desktop bash /mnt/repo/witanime/start_bot.sh
+docker exec -u root -e GITHUB_TOKEN="$GITHUB_TOKEN" xfce-desktop bash /mnt/repo/witanime/start_bot.sh

@@ -14,6 +14,16 @@ LOG="$WORK_DIR/watcher.log"
 
 mkdir -p "$WORK_DIR" "$REPO_DIR/witanime/jobs" "$REPO_DIR/witanime/output"
 
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    git config --global credential.https://github.com.helper \
+        '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN}"; }; f'
+    echo "==> GitHub push credentials configured (GITHUB_TOKEN)"
+else
+    echo "[!] GITHUB_TOKEN is not set: the watcher can download and publish, but"
+    echo "    pushing job-file removals to GitHub will fail. Start it like this:"
+    echo "    docker exec -u root -e GITHUB_TOKEN=\"\$GITHUB_TOKEN\" <container> bash $0"
+fi
+
 echo "==> Stopping any previous watcher"
 pkill -f "witanime_dl.py --watch" 2>/dev/null && sleep 1 || true
 

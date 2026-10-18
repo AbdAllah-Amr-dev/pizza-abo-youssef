@@ -553,7 +553,11 @@ def git_run(repo, *args, timeout=180):
 
 def git_pull(repo):
     before = git_run(repo, "rev-parse", "HEAD").stdout.strip()
-    r = git_run(repo, "pull", "--ff-only", "--quiet")
+    r = git_run(repo, "pull", "--rebase", "--autostash", "--quiet", timeout=300)
+    if r.returncode != 0:
+        gitdir = Path(repo) / ".git"
+        if (gitdir / "rebase-merge").exists() or (gitdir / "rebase-apply").exists():
+            git_run(repo, "rebase", "--abort")
     after = git_run(repo, "rev-parse", "HEAD").stdout.strip()
     err = (r.stderr or r.stdout or "").strip().splitlines()
     return r.returncode == 0, (before != after), (err[-1] if err else "")
